@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Trading Dashboard — BTC / ETH / SPX / NZDUSD</title>
+
+  <!-- Lightweight Charts (production standalone) -->
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    :root{
+      --bg:#0d1117;
+      --panel:#0f1620;
+      --muted:#9aa4b2;
+      --accent:#26a69a;
+      --danger:#ef5350;
+      --btn:#30363d;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:Inter,Arial,Helvetica,sans-serif;
+      background:var(--bg);
+      color:#e6eef6;
+    }
+
+    header{
+      display:flex;
+      gap:12px;
+      align-items:center;
+      padding:12px;
+      background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+      position:sticky;
+      top:0;
+      z-index:10;
+    }
+
+    .brand{
+      font-weight:700;
+      font-size:16px;
+      margin-right:8px;
+    }
+
+    .controls{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      align-items:center;
+      margin-left:6px;
+    }
+
+    select, button {
+      background:var(--btn);
+      color: #e6eef6;
+      border:1px solid #444;
+      padding:7px 10px;
+      border-radius:6px;
+      cursor:pointer;
+      font-size:14px;
+    }
+    select { min-width:150px; }
+
+    button.active {
+      box-shadow: 0 0 0 2px rgba(38,166,154,0.14);
+      border-color: rgba(38,166,154,0.9);
+      background: linear-gradient(180deg, #1f7f6f, #164f41);
+    }
+
+    main {
+      display:flex;
+      gap:12px;
+      padding:12px;
+    }
+
+    #left {
+      flex:1 1 75%;
+      min-width:300px;
+    }
+
+    #right {
+      width:320px;
+      background:var(--panel);
+      border:1px solid #1f2933;
+      padding:12px;
+      border-radius:8px;
+      height: calc(100vh - 80px);
+      overflow:auto;
+    }
+
+    #chart {
+      width:100%;
+      height: calc(100vh - 160px);
+      border-radius:6px;
+      overflow:hidden;
+      background: var(--bg);
+    }
+
+    .ranges { display:flex; gap:6px; margin-left:6px; }
+    .muted { color:var(--muted); font-size:13px; margin-top:6px; }
+
+    .stat { margin-bottom:10px; font-size:14px; }
+    .stat b{ color:#fff;}
+    .footerNote{ font-size:12px; color:var(--muted); margin-top:10px; }
+
+    @media(max-width:900px){
+      main{flex-direction:column;}
+      #right{width:100%; height:auto;}
+      #chart{height:60vh;}
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="brand">Trading Dashboard — PRO</div>
+
+  <div class="controls">
+    <label style="font-size:13px;color:var(--muted);margin-right:6px">Activo</label>
+    <select id="assetSelect">
+      <option value="BTC">Bitcoin — BTC/USD</option>
+      <option value="ETH">Ethereum — ETH/USD</option>
+      <option value="SPX">S&P 500 — SPX</option>
+      <option value="NZDUSD">FX — NZD/USD</option>
+    </select>
+
+    <div class="ranges" id="rangeButtons">
+      <button data-days="90">3M</button>
+      <button data-days="180" class="active">6M</button>
+      <button data-days="365">1Y</button>
+      <button data-days="1825">5Y</button>
+      <button data-days="3650">10Y</button>
+    </div>
+
+    <button id="refreshBtn" title="Actualizar datos">⟳</button>
+  </div>
+</header>
+
+<main>
+  <section id="left">
+    <div id="chart"></div>
+  </section>
+
+  <aside id="right">
+    <div class="stat">Activo: <b id="statAsset">BTC/USD</b></div>
+    <div class="stat">Último precio: <b id="statPrice">-</b></div>
+    <div class="stat">Rango seleccionado: <b id="statRange">6M</b></div>
+    <div class="muted">Indicadores: <span id="statInd">EMA20 · SMA50</span></div>
+
+    <div class="footerNote">
+      Fuentes: Yahoo Finance (históricas OHLC) y CoinGecko (si Yahoo bloquea cryptos).<br>
+      Si ves un error de CORS en el navegador, avisame y te doy solución alternativa.
+    </div>
+  </aside>
+</main>
+
+<script>
+/*
+  Lógica:
+  - Selector: BTC, ETH -> Yahoo symbol 'BTC-USD' / 'ETH-USD' (fallback CoinGecko if needed)
+  - SPX -> Yahoo '^GSPC'
+  - NZDUSD -> Yahoo 'NZDUSD=X'
+  - We call Yahoo Finance chart API with period1/period2 unix timestamps and interval=1d
+  - Parse timestamps + indicators.quote to build OHLC candles
+  - Compute EMA20 and SMA50 on close prices and plot as line series
+*/
+
+const assetSelect = document.getElementById('assetSelect');
+const rangeButtons = document.getElementById('rangeButtons');
+const refreshBtn = document.getElementById('refreshBtn');
+const statAsset = document.getElementById('statAsset');
+const statPrice = document.getElementById('statPrice');
+const statRange = document.getElementById('statRange');
+
+let selectedAsset = assetSelect.value; // BTC default
+let selectedDays = 180; // 6M default
+
+// Map to Yahoo symbols
+const YAHOO_SYMBOLS = {
+  BTC: 'BTC-USD',
+  ETH: 'ETH-USD',
+  SPX: '^GSPC',
+  NZDUSD: 'NZDUSD=X'
+};
+
+// Create chart
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+  width: document.getElementById('chart').clientWidth,
+  height: document.getElementById('chart').clientHeight,
+  layout: {
+    background: { color: '#0d1117' },
+    textColor: '#d1d4dc',
+  },
+  grid: {
+    vertLines: { color: '#16171b' },
+    horzLines: { color: '#16171b' },
+  },
+  rightPriceScale: { borderColor: '#23262b' },
+  timeScale: { borderColor: '#23262b' },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+});
+
+// series
+const candleSeries = chart.addCandlestickSeries({
+  upColor: "#26a69a",
+  downColor: "#ef5350",
+  wickUpColor: "#26a69a",
+  wickDownColor: "#ef5350",
+  borderVisible: false,
+});
+
+// indicator series
+const emaSeries = chart.addLineSeries({ color: '#ffcc00', lineWidth: 2 });
+const smaSeries = chart.addLineSeries({ color: '#00aaff', lineWidth: 2 });
+
+// helpers - timestamps
+function unixNow() { return Math.floor(Date.now()/1000); }
+function daysAgoUnix(days) { return Math.floor((Date.now() - days*24*60*60*1000)/1000); }
+
+// compute EMA and SMA (simple JS)
+function computeSMA(values, period) {
+  const res = [];
+  for (let i = 0; i < values.length; i++) {
+    if (i + 1 < period) { res.push(null); continue; }
+    let sum = 0;
+    for (let j = i - period + 1; j <= i; j++) sum += values[j];
+    res.push(sum / period);
+  }
+  return res;
+}
+function computeEMA(values, period) {
+  const res = [];
+  const k = 2 / (period + 1);
+  let emaPrev = null;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (i === 0) { emaPrev = v; res.push(emaPrev); continue; }
+    emaPrev = v * k + emaPrev * (1 - k);
+    res.push(emaPrev);
+  }
+  return res;
+}
+
+function buildCandlesFromYahoo(json) {
+  // json.chart.result[0] contains timestamp + indicators.quote[0]
+  try {
+    const r = json.chart.result[0];
+    const t = r.timestamp; // seconds
+    const q = r.indicators.quote[0];
+    const o = q.open, h = q.high, l = q.low, c = q.close;
+    const candles = [];
+    for (let i = 0; i < t.length; i++) {
+      // some values may be null; skip nulls
+      if (o[i] == null || h[i] == null || l[i] == null || c[i] == null) continue;
+      candles.push({
+        time: t[i],
+        open: o[i],
+        high: h[i],
+        low: l[i],
+        close: c[i]
+      });
+    }
+    return candles;
+  } catch(e){
+    console.error('Error parsing Yahoo response', e);
+    return null;
+  }
+}
+
+async function fetchYahoo(symbol, days) {
+  // compute period1 and period2
+  const period2 = unixNow();
+  const period1 = daysAgoUnix(days);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d&events=div%2Csplit`;
+  // fetch
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Yahoo fetch failed: ' + res.status);
+  const json = await res.json();
+  return json;
+}
+
+// fallback for crypto: CoinGecko (if Yahoo blocks)
+async function fetchCoinGeckoCrypto(coinId, days) {
+  // coinId: 'bitcoin' or 'ethereum'; days can be 'max' or number of days
+  const url = `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('CoinGecko fetch failed: ' + res.status);
+  const json = await res.json();
+  // CoinGecko returns prices array [ [timestamp_ms, price], ... ]
+  // But no OHLC; we'll convert to small candles by grouping per day (simple)
+  const prices = json.prices || [];
+  // Build daily OHLC using a map by date (UTC)
+  const map = new Map();
+  prices.forEach(p => {
+    const ms = p[0];
+    const price = p[1];
+    const date = new Date(ms);
+    date.setUTCHours(0,0,0,0);
+    const key = date.getTime()/1000;
+    if (!map.has(key)) map.set(key, {open:price,high:price,low:price,close:price});
+    else {
+      const entry = map.get(key);
+      if (price > entry.high) entry.high = price;
+      if (price < entry.low) entry.low = price;
+      entry.close = price;
+    }
+  });
+  const candles = [];
+  for (const [time, v] of map) {
+    candles.push({ time: time, open: v.open, high: v.high, low: v.low, close: v.close });
+  }
+  // sort by time
+  candles.sort((a,b)=>a.time-b.time);
+  return candles;
+}
+
+// main loader
+async function loadAsset(asset, days) {
+  statAsset.textContent = asset;
+  statRange.textContent = (days===90?'3M':days===180?'6M':days===365?'1Y':days===1825?'5Y':days===3650?'10Y':days+'d');
+  try {
+    let candles = null;
+    const symbol = YAHOO_SYMBOLS[asset];
+
+    // Try Yahoo first (works for SPX and FX and often for crypto)
+    try {
+      const json = await fetchYahoo(symbol, days);
+      candles = buildCandlesFromYahoo(json);
+    } catch (e) {
+      console.warn('Yahoo failed, trying fallback for crypto', e);
+      // fallback to CoinGecko for BTC/ETH
+      if (asset === 'BTC') candles = await fetchCoinGeckoCrypto('bitcoin', Math.min(days, 3650));
+      if (asset === 'ETH') candles = await fetchCoinGeckoCrypto('ethereum', Math.min(days, 3650));
+      // For SPX or FX if yahoo fails, we'll throw
+    }
+
+    if (!candles || candles.length === 0) throw new Error('No candle data');
+
+    // set to chart
+    candleSeries.setData(candles);
+
+    // latest price
+    const last = candles[candles.length-1];
+    statPrice.textContent = last.close.toFixed(2);
+
+    // build arrays for indicator calculations
+    const closes = candles.map(c=>c.close);
+
+    // compute EMA20 and SMA50
+    const ema = computeEMA(closes, 20);
+    const sma = computeSMA(closes, 50);
+
+    const emaData = [];
+    const smaData = [];
+    for (let i = 0; i < candles.length; i++) {
+      const t = candles[i].time;
+      if (ema[i] != null && !isNaN(ema[i])) emaData.push({ time: t, value: Number(ema[i].toFixed(6)) });
+      if (sma[i] != null && !isNaN(sma[i])) smaData.push({ time: t, value: Number(sma[i].toFixed(6)) });
+    }
+
+    emaSeries.setData(emaData);
+    smaSeries.setData(smaData);
+
+    // fit to data
+    chart.timeScale().fitContent();
+
+  } catch (err) {
+    console.error(err);
+    alert('Error cargando datos: ' + (err.message || err));
+  }
+}
+
+// UI events
+assetSelect.addEventListener('change', (e) => {
+  selectedAsset = e.target.value;
+  // update label
+  const labels = { BTC:'BTC/USD', ETH:'ETH/USD', SPX:'S&P 500 (SPX)', NZDUSD:'NZD/USD' };
+  statAsset.textContent = labels[selectedAsset] || selectedAsset;
+  // reload
+  loadAsset(selectedAsset, selectedDays);
+});
+
+rangeButtons.querySelectorAll('button').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    rangeButtons.querySelectorAll('button').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedDays = Number(btn.getAttribute('data-days'));
+    statRange.textContent = btn.textContent;
+    loadAsset(selectedAsset, selectedDays);
+  });
+});
+
+refreshBtn.addEventListener('click', ()=> loadAsset(selectedAsset, selectedDays));
+
+// initial load
+loadAsset(selectedAsset, selectedDays);
+
+// handle resize
+window.addEventListener('resize', ()=> chart.resize(document.getElementById('chart').clientWidth, document.getElementById('chart').clientHeight));
+</script>
+
+</body>
+</html>
